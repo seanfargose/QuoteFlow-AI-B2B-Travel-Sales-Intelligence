@@ -59,10 +59,36 @@ export interface MissingFieldDiagnostic {
   clarificationPromptTemplate: string;
 }
 
+export interface FieldAssumption {
+  field: string;
+  value: string;
+  isExplicit: boolean; // true = explicitly mentioned by agent; false = inferred assumption
+  confidence: number;  // 0.0 to 1.0
+  rationale: string;
+}
+
+export interface ConflictFlag {
+  id: string;
+  category: 'PASSENGER_COUNT' | 'TRAVEL_DATES' | 'PREFERENCE_CONTRADICTION' | 'BUDGET_MISMATCH';
+  description: string;
+  conflictingSnippets: string[];
+  severity: 'CRITICAL' | 'WARNING';
+}
+
+export interface RequirementEditLog {
+  id: string;
+  timestamp: string;
+  editedBy: string;
+  field: string;
+  oldValue: any;
+  newValue: any;
+  reason?: string;
+}
+
 export interface TravelRequirement {
   id: string;
   agentId: string;
-  sourceChannel: 'WHATSAPP' | 'EMAIL' | 'PORTAL_QUICK_ENTRY';
+  sourceChannel: 'WHATSAPP' | 'EMAIL' | 'PHONE_CALL_NOTES' | 'PORTAL_QUICK_ENTRY';
   rawInquiryText: string;
   destinationCorridor: DestinationCorridor;
   cities: { cityName: string; nights: number }[];
@@ -79,8 +105,14 @@ export interface TravelRequirement {
   preferences: TravellerPreferences;
   completenessScore: number; // 0 to 100
   missingFields: MissingFieldDiagnostic[];
+  assumptions: FieldAssumption[];
+  conflictFlags: ConflictFlag[];
+  clarificationQuestions: string[];
+  editHistory: RequirementEditLog[];
+  priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
   status: 'INGESTED' | 'CLARIFICATION_PENDING' | 'PARSED_READY' | 'QUOTED';
   extractedAt: string;
+  lastActivityAt: string;
 }
 
 export type SupplierType = 'DMC' | 'HOTEL_PROPERTY' | 'AIRLINE' | 'TRANSFER_OPERATOR' | 'ACTIVITY_PROVIDER';

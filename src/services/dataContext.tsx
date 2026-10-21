@@ -1,6 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
+import { scoreRequirementCompleteness } from '../domain/completenessEngine';
 import { 
   TravelRequirement, 
   Quote, 
@@ -9,7 +10,8 @@ import {
   HotelRate, 
   TravelAgent, 
   ActivityEvent,
-  QuoteLifecycleStatus
+  QuoteLifecycleStatus,
+  RequirementEditLog
 } from '../types';
 import { 
   SEED_AGENTS, 
@@ -33,6 +35,8 @@ interface DataContextType {
   // Actions
   addRequirement: (req: TravelRequirement) => void;
   updateRequirementStatus: (id: string, status: TravelRequirement['status']) => void;
+  editRequirement: (id: string, updatedFields: Partial<TravelRequirement>, reason?: string) => void;
+  resolveConflict: (requirementId: string, conflictId: string, resolutionNotes: string) => void;
   addQuote: (quote: Quote) => void;
   updateQuoteStatus: (id: string, status: QuoteLifecycleStatus) => void;
   approveManagerOverride: (quoteId: string, notes?: string) => void;
@@ -100,7 +104,125 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const updateRequirementStatus = (id: string, status: TravelRequirement['status']) => {
-    setRequirements(prev => prev.map(r => r.id === id ? { ...r, status } : r));
+    setRequirements(prev => prev.map(r => r.id === id ? { ...r, status, lastActivityAt: new Date().toISOString() } : r));
+  };
+
+  const editRequirement = (id: string, updatedFields: Partial<TravelRequirement>, reason?: string) => {
+    setRequirements(prev => prev.map(r => {
+      if (r.id !== id) return r;
+
+      const editLogs: RequirementEditLog[] = [];
+      const keys = Object.keys(updatedFields) as (keyof TravelRequirement)[];
+
+      keys.forEach(k => {
+        // Do not allow raw original inquiry text to be overwritten; preserve original verbatim message!
+        if (k === 'rawInquiryText' || k === 'editHistory' || k === 'id') return;
+
+        const oldVal = r[k];
+        const newVal = updatedFields[k];
+
+        if (JSON.stringify(oldVal) !== JSON.stringify(newVal)) {
+          editLogs.push({
+            id: `edit_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+            timestamp: new Date().toISOString(),
+            editedBy: 'Priya Sharma (Sales Executive)',
+            field: String(k),
+            oldValue: oldVal,
+            newValue: newVal,
+            reason: reason || 'Sales executive parameter confirmation',
+          });
+        }
+      });
+
+      const updatedRequirement: TravelRequirement = {
+        ...r,
+        ...updatedFields,
+        rawInquiryText: r.rawInquiryText, // Preserved inviolate
+        editHistory: [...(r.editHistory || []), ...editLogs],
+        lastActivityAt: new Date().toISOString(),
+      };
+
+      // Recalculate completeness score transparently
+      const completeness = scoreRequirementCompleteness({
+        destinationCorridor: updatedRequirement.destinationCorridor,
+        tentativeTravelDate: updatedRequirement.tentativeTravelDate,
+        totalDurationNights: updatedRequirement.totalDurationNights,
+        passengers: updatedRequirement.passengers,
+        flightPreference: updatedRequirement.flightPreference,
+        departureAirport: updatedRequirement.departureAirport,
+        mealPlanRequested: updatedRequirement.mealPlanRequested,
+      });
+
+      updatedRequirement.completenessScore = completeness.score;
+      updatedRequirement.missingFields = completeness.missingFields;
+
+      // If all blocking fields resolved and no critical conflicts, elevate to PARSED_READY
+      if (completeness.isReadyForQuoting && updatedRequirement.conflictFlags.length === 0) {
+        if (updatedRequirement.status === 'CLARIFICATION_PENDING' || updatedRequirement.status === 'INGESTED') {
+          updatedRequirement.status = 'PARSED_READY';
+        }
+      }
+
+      return updatedRequirement;
+    }));
+
+    recordActivityEvent({
+      type: 'REQUIREMENT_EDITED',
+      entityType: 'REQUIREMENT',
+      entityId: id,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Updated structured fields: ${Object.keys(updatedFields).filter(k => k !== 'rawInquiryText').join(', ')} (${reason || 'Confirmed with agent'})`,
+    });
+  };
+
+  const resolveConflict = (requirementId: string, conflictId: string, resolutionNotes: string) => {
+    setRequirements(prev => prev.map(r => {
+      if (r.id !== requirementId) return r;
+
+      const remainingConflicts = r.conflictFlags.filter(c => c.id !== conflictId);
+      const resolvedConflict = r.conflictFlags.find(c => c.id === conflictId);
+
+      const log: RequirementEditLog = {
+        id: `edit_conf_${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        editedBy: 'Priya Sharma (Sales Executive)',
+        field: 'conflictFlags',
+        oldValue: resolvedConflict ? resolvedConflict.description : 'Conflict Active',
+        newValue: `Resolved: ${resolutionNotes}`,
+        reason: resolutionNotes,
+      };
+
+      const updatedRequirement: TravelRequirement = {
+        ...r,
+        conflictFlags: remainingConflicts,
+        editHistory: [...(r.editHistory || []), log],
+        lastActivityAt: new Date().toISOString(),
+      };
+
+      const completeness = scoreRequirementCompleteness({
+        destinationCorridor: updatedRequirement.destinationCorridor,
+        tentativeTravelDate: updatedRequirement.tentativeTravelDate,
+        totalDurationNights: updatedRequirement.totalDurationNights,
+        passengers: updatedRequirement.passengers,
+        flightPreference: updatedRequirement.flightPreference,
+        departureAirport: updatedRequirement.departureAirport,
+        mealPlanRequested: updatedRequirement.mealPlanRequested,
+      });
+
+      if (remainingConflicts.length === 0 && completeness.isReadyForQuoting) {
+        updatedRequirement.status = 'PARSED_READY';
+      }
+
+      return updatedRequirement;
+    }));
+
+    recordActivityEvent({
+      type: 'CONFLICT_RESOLVED',
+      entityType: 'REQUIREMENT',
+      entityId: requirementId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Conflict resolved: ${resolutionNotes}`,
+    });
   };
 
   const addQuote = (quote: Quote) => {
@@ -192,6 +314,8 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         activityEvents,
         addRequirement,
         updateRequirementStatus,
+        editRequirement,
+        resolveConflict,
         addQuote,
         updateQuoteStatus,
         approveManagerOverride,
