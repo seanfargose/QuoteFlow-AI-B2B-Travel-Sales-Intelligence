@@ -3,8 +3,17 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { scoreRequirementCompleteness } from '../domain/completenessEngine';
 import { 
+  calculateQuoteVersionTotals, 
+  createNewQuoteVersion, 
+  generateInitialQuoteForRequirement,
+  checkQuoteRisks
+} from '../domain/pricingEngine';
+import { 
   TravelRequirement, 
   Quote, 
+  QuoteLineItem,
+  QuoteVersion,
+  PackageTier,
   FollowUpTask, 
   Booking, 
   HotelRate, 
@@ -45,6 +54,15 @@ interface DataContextType {
   addBooking: (booking: Booking) => void;
   recordActivityEvent: (event: Omit<ActivityEvent, 'id' | 'timestamp'>) => void;
   resetAllData: () => void;
+
+  // Quote Workbench Actions
+  updateQuoteLineItem: (quoteId: string, versionId: string, lineItemId: string, updatedFields: Partial<QuoteLineItem>) => void;
+  addLineItemToQuote: (quoteId: string, versionId: string, newItem: QuoteLineItem) => void;
+  removeLineItemFromQuote: (quoteId: string, versionId: string, lineItemId: string) => void;
+  updateQuoteMarkup: (quoteId: string, versionId: string, markupPercentage: number) => void;
+  createQuoteNewVersion: (quoteId: string, changeReason: string) => void;
+  createQuoteForRequirement: (requirementId: string, tier?: PackageTier) => string;
+  markQuoteAsSent: (quoteId: string) => void;
 }
 
 const DataContext = createContext<DataContextType | undefined>(undefined);
@@ -292,6 +310,317 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setActivityEvents(prev => [newEvent, ...prev]);
   };
 
+  // Quote Workbench Actions
+  const updateQuoteLineItem = (
+    quoteId: string, 
+    versionId: string, 
+    lineItemId: string, 
+    updatedFields: Partial<QuoteLineItem>
+  ) => {
+    setQuotes(prev => prev.map(q => {
+      if (q.id !== quoteId) return q;
+
+      const req = requirements.find(r => r.id === q.requirementId);
+      const paxCount = (req?.passengers?.adults || 2) + (req?.passengers?.children || 0);
+
+      const updatedVersions = q.versions.map(v => {
+        if (v.versionId !== versionId) return v;
+
+        const updatedLineItems = v.lineItems.map(item => {
+          if (item.id !== lineItemId) return item;
+          const merged = { ...item, ...updatedFields };
+          const unitCost = merged.unitNetCostForeign ?? 0;
+          const qty = merged.units ?? 1;
+          const fx = merged.fxRateToInr ?? 1;
+          merged.totalNetCostInr = Math.round(unitCost * qty * fx * 1.015);
+          merged.sellingPriceInr = Math.round(merged.totalNetCostInr * (1 + (merged.markupPercentage ?? v.markupPercentage ?? 0.12)));
+          return merged;
+        });
+
+        const totals = calculateQuoteVersionTotals(
+          updatedLineItems, 
+          v.markupPercentage, 
+          paxCount
+        );
+
+        return {
+          ...v,
+          lineItems: updatedLineItems,
+          totalLandNetCostInr: totals.totalLandNetCostInr,
+          totalFlightNetCostInr: totals.totalFlightNetCostInr,
+          totalNetCostInr: totals.totalNetCostInr,
+          grossProfitInr: totals.markupAmountInr,
+          totalSellingPriceInr: totals.totalSellingPriceInr,
+          perPersonSellingPriceInr: totals.perPersonSellingPriceInr,
+        };
+      });
+
+      return {
+        ...q,
+        versions: updatedVersions,
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+
+    recordActivityEvent({
+      type: 'QUOTE_EDITED',
+      entityType: 'QUOTE',
+      entityId: quoteId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Modified line item in quote version ${versionId}`,
+    });
+  };
+
+  const addLineItemToQuote = (quoteId: string, versionId: string, newItem: QuoteLineItem) => {
+    setQuotes(prev => prev.map(q => {
+      if (q.id !== quoteId) return q;
+
+      const req = requirements.find(r => r.id === q.requirementId);
+      const paxCount = (req?.passengers?.adults || 2) + (req?.passengers?.children || 0);
+
+      const updatedVersions = q.versions.map(v => {
+        if (v.versionId !== versionId) return v;
+
+        const updatedLineItems = [...v.lineItems, newItem];
+        const totals = calculateQuoteVersionTotals(
+          updatedLineItems, 
+          v.markupPercentage, 
+          paxCount
+        );
+
+        return {
+          ...v,
+          lineItems: updatedLineItems,
+          totalLandNetCostInr: totals.totalLandNetCostInr,
+          totalFlightNetCostInr: totals.totalFlightNetCostInr,
+          totalNetCostInr: totals.totalNetCostInr,
+          grossProfitInr: totals.markupAmountInr,
+          totalSellingPriceInr: totals.totalSellingPriceInr,
+          perPersonSellingPriceInr: totals.perPersonSellingPriceInr,
+        };
+      });
+
+      return {
+        ...q,
+        versions: updatedVersions,
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+
+    recordActivityEvent({
+      type: 'QUOTE_EDITED',
+      entityType: 'QUOTE',
+      entityId: quoteId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Added "${newItem.title}" to quote version ${versionId}`,
+    });
+  };
+
+  const removeLineItemFromQuote = (quoteId: string, versionId: string, lineItemId: string) => {
+    setQuotes(prev => prev.map(q => {
+      if (q.id !== quoteId) return q;
+
+      const req = requirements.find(r => r.id === q.requirementId);
+      const paxCount = (req?.passengers?.adults || 2) + (req?.passengers?.children || 0);
+
+      const updatedVersions = q.versions.map(v => {
+        if (v.versionId !== versionId) return v;
+
+        const updatedLineItems = v.lineItems.filter(item => item.id !== lineItemId);
+        const totals = calculateQuoteVersionTotals(
+          updatedLineItems, 
+          v.markupPercentage, 
+          paxCount
+        );
+
+        return {
+          ...v,
+          lineItems: updatedLineItems,
+          totalLandNetCostInr: totals.totalLandNetCostInr,
+          totalFlightNetCostInr: totals.totalFlightNetCostInr,
+          totalNetCostInr: totals.totalNetCostInr,
+          grossProfitInr: totals.markupAmountInr,
+          totalSellingPriceInr: totals.totalSellingPriceInr,
+          perPersonSellingPriceInr: totals.perPersonSellingPriceInr,
+        };
+      });
+
+      return {
+        ...q,
+        versions: updatedVersions,
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+
+    recordActivityEvent({
+      type: 'QUOTE_EDITED',
+      entityType: 'QUOTE',
+      entityId: quoteId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Removed line item from quote version ${versionId}`,
+    });
+  };
+
+  const updateQuoteMarkup = (quoteId: string, versionId: string, markupPercentage: number) => {
+    setQuotes(prev => prev.map(q => {
+      if (q.id !== quoteId) return q;
+
+      const req = requirements.find(r => r.id === q.requirementId);
+      const paxCount = (req?.passengers?.adults || 2) + (req?.passengers?.children || 0);
+
+      const updatedVersions = q.versions.map(v => {
+        if (v.versionId !== versionId) return v;
+
+        const totals = calculateQuoteVersionTotals(
+          v.lineItems, 
+          markupPercentage / 100, 
+          paxCount
+        );
+
+        return {
+          ...v,
+          markupPercentage: markupPercentage / 100,
+          totalLandNetCostInr: totals.totalLandNetCostInr,
+          totalFlightNetCostInr: totals.totalFlightNetCostInr,
+          totalNetCostInr: totals.totalNetCostInr,
+          grossProfitInr: totals.markupAmountInr,
+          totalSellingPriceInr: totals.totalSellingPriceInr,
+          perPersonSellingPriceInr: totals.perPersonSellingPriceInr,
+        };
+      });
+
+      // Check if gross margin is below 8% floor
+      const activeV = updatedVersions.find(v => v.versionId === versionId);
+      const grossMarginPct = activeV && activeV.totalSellingPriceInr > 0 
+        ? (activeV.grossProfitInr / activeV.totalSellingPriceInr) * 100 
+        : 0;
+      const isSubFloor = grossMarginPct < 8.0;
+
+      return {
+        ...q,
+        versions: updatedVersions,
+        status: isSubFloor ? 'PENDING_APPROVAL' : (q.status === 'PENDING_APPROVAL' ? 'DRAFT' : q.status),
+        approvalState: {
+          ...q.approvalState,
+          isApprovalRequired: isSubFloor,
+          triggerReason: isSubFloor ? 'MARGIN_BELOW_FLOOR' : undefined,
+          approvalStatus: isSubFloor ? 'PENDING' : 'NOT_REQUIRED',
+          approverNotes: isSubFloor ? 'Gross margin dropped below 8.0% company floor. Requires manager sign-off.' : undefined,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+
+    recordActivityEvent({
+      type: 'QUOTE_EDITED',
+      entityType: 'QUOTE',
+      entityId: quoteId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Adjusted cost-based markup to ${markupPercentage.toFixed(1)}%`,
+    });
+  };
+
+  const createQuoteNewVersion = (quoteId: string, changeReason: string) => {
+    setQuotes(prev => prev.map(q => {
+      if (q.id !== quoteId) return q;
+
+      const currentActive = q.versions.find(v => v.versionId === q.currentVersionId) || q.versions[q.versions.length - 1];
+      if (!currentActive) return q;
+
+      const req = requirements.find(r => r.id === q.requirementId);
+      const paxCount = (req?.passengers?.adults || 2) + (req?.passengers?.children || 0);
+
+      const newVer = createNewQuoteVersion(
+        currentActive, 
+        currentActive.lineItems, 
+        currentActive.markupPercentage, 
+        paxCount, 
+        changeReason
+      );
+
+      return {
+        ...q,
+        currentVersionId: newVer.versionId,
+        versions: [...q.versions, newVer],
+        status: 'DRAFT',
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+
+    recordActivityEvent({
+      type: 'QUOTE_VERSION_CREATED',
+      entityType: 'QUOTE',
+      entityId: quoteId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Created new quote version. Reason: ${changeReason}`,
+    });
+  };
+
+  const createQuoteForRequirement = (requirementId: string, tier: PackageTier = 'CURATED_RECOMMENDED'): string => {
+    const requirement = requirements.find(r => r.id === requirementId);
+    if (!requirement) throw new Error(`Requirement ${requirementId} not found`);
+
+    const newQuote = generateInitialQuoteForRequirement(requirement);
+    if (tier) {
+      const matchVer = newQuote.versions.find((v: QuoteVersion) => v.packageTier === tier);
+      if (matchVer) {
+        newQuote.currentVersionId = matchVer.versionId;
+        newQuote.activeTier = tier;
+      }
+    }
+
+    setQuotes(prev => [newQuote, ...prev]);
+
+    // Update requirement status to QUOTED
+    setRequirements(prev => prev.map(r => r.id === requirementId ? { ...r, status: 'QUOTED', lastActivityAt: new Date().toISOString() } : r));
+
+    recordActivityEvent({
+      type: 'QUOTE_CREATED',
+      entityType: 'QUOTE',
+      entityId: newQuote.id,
+      actor: 'QuoteFlow AI Engine',
+      description: `Drafted ${tier.replace('_', ' ')} package quote for ${requirement.contactName || 'Agent'} (${requirement.destinationCorridor})`,
+    });
+
+    return newQuote.id;
+  };
+
+  const markQuoteAsSent = (quoteId: string) => {
+    setQuotes(prev => prev.map(q => {
+      if (q.id !== quoteId) return q;
+      return {
+        ...q,
+        status: 'DELIVERED',
+        updatedAt: new Date().toISOString(),
+      };
+    }));
+
+    // Auto-create Follow-up task
+    const targetQuote = quotes.find(q => q.id === quoteId);
+    if (targetQuote) {
+      const newFollowUp: FollowUpTask = {
+        id: `fu_auto_${Date.now()}`,
+        quoteId: quoteId,
+        agentId: targetQuote.agentId,
+        priority: 'HIGH_ATTENTION',
+        triggerEvent: 'AGENT_SILENT_24H',
+        suggestedActionTitle: 'WhatsApp Quote Dispatch Follow-up',
+        suggestedMessageCopy: 'Hi, just following up on the quotation sent earlier. Let me know if you would like me to adjust any hotel options or hold inventory.',
+        scheduledFor: new Date(Date.now() + 4 * 3600 * 1000).toISOString(),
+        status: 'PENDING',
+      };
+      setFollowUps(prev => [newFollowUp, ...prev]);
+    }
+
+    recordActivityEvent({
+      type: 'QUOTE_SENT',
+      entityType: 'QUOTE',
+      entityId: quoteId,
+      actor: 'Priya Sharma (Sales Executive)',
+      description: `Sent proposal to travel agent via WhatsApp/Email demo dispatch`,
+    });
+  };
+
   const resetAllData = () => {
     localStorage.clear();
     setRequirements(SEED_REQUIREMENTS);
@@ -324,6 +653,13 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         addBooking,
         recordActivityEvent,
         resetAllData,
+        updateQuoteLineItem,
+        addLineItemToQuote,
+        removeLineItemFromQuote,
+        updateQuoteMarkup,
+        createQuoteNewVersion,
+        createQuoteForRequirement,
+        markQuoteAsSent,
       }}
     >
       {children}
